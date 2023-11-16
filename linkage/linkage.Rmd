@@ -18,7 +18,7 @@ editor_options:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, cache = TRUE, tidy = TRUE, fig.width = 7, dpi = 400, warning = FALSE)
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, tidy = TRUE, fig.width = 7, dpi = 400, warning = FALSE) 
 ```
 
 # Full-sib populations
