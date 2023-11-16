@@ -1,0 +1,553 @@
+---
+title: "Phenotypic Analyses and GWAS for a Cassava Population"
+subtitle: "CIAT Training"
+author: "Guilherme da Silva Pereira and João Ricardo Rosa"
+date: "November 16, 2023"
+output:
+  html_document:
+    highlight: tango
+    keep_md: yes
+    theme: bootstrap
+    toc: yes
+    toc_depth: '3'
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Installing and loading R Packages:
+
+```{r, cache=FALSE, warning=FALSE, message=FALSE}
+package.cran <- c("tidyverse", "sommer", "PerformanceAnalytics", "vcfR", "ggplot2", "bigmemory", "RColorBrewer", "factoextra", "rMVP", "statgenGWAS")
+missing.cran <- setdiff(package.cran, rownames(installed.packages()))
+if(length(missing.cran) > 0) install.packages(c(missing.cran), dep = TRUE) 
+invisible(lapply(c(package.cran), library, character.only = TRUE))
+```
+
+# Introduction
+
+This tutorial reports the phenotypic data analysis and genetic mapping for a cassava population, which is part of the mapping current studies developed by the CIAT Breeding Program, Colombia. Our aim is to use this population to provide an introductory training on quantitative genetics to the CIAT Breeding Team. 
+
+The used population consists of 381 individuals belonging to six full-sib families, which have been phenotyped for cooking quality traits. A total of seven parents were crossed to generate these six families: 
+
+1. SM3759-36 x VEN25
+2. COL2246 x COL1722
+3. COL1910 x SM3759-36
+4. COL1910 x COL1505
+5. COL1505 x COL1910
+6. VEN208 x VEN25
+
+Four parents and 226 progenies were genotyped for 8,590,486 single nucleotide polymorphism (SNP) markers (BGI), distributed in the entire genome (18 chromosomes + scaffolds) stored in variant call format (VCF) file. The VCF also has SNPs called together with a second population (370 clones) focused on beta-carotene content. For the sake of time, we'll onlly deal with the first population.
+
+The present training is structured as follows:
+
+- phenotypic analysis of quality traits via mixed models, using three specific traits (DM_NIRS, WAB_20min_mean, and WAB_30min_mean) evaluated in four trials during years 2020 and 2021
+- construction of genetic linkage map for one of the five full-sib families (SM3759-36 x VEN25), which presented the larger amount of genotyped progenies ($n=49$) and both parents genotyped among all families
+- quantitative trait loci (QTL) mapping, via composite interval mapping (CIM), for the three cooking quality traits
+- genome-wide association study (GWAS) for the same traits, considering all the five full-sib families. 
+
+Also for the sake of time, we'll use a subset of 9,000 SNP ($\sim$0.1\%) markers randomly sampled out of the 8.5M markers. 
+
+# Phenotypic Analyses via Mixed Models
+
+## Data and Exploratory Analysis
+
+```{r}
+data.pheno <- read.csv("01_RTBfoods_progeny_2020_2021_4_env 2022-05-08.csv") 
+head(data.pheno)
+str(data.pheno)
+data.pheno <- data.pheno %>% arrange(trial_harvest, rep_number, col_number, row_number, accession_name)
+factors <- c("trial_harvest", "rep_number", "accession_name")
+data.pheno[,factors] <- lapply(data.pheno[,factors], factor)
+str(data.pheno)
+table(data.pheno$trial_harvest)
+colnames(data.pheno)
+traits <- colnames(data.pheno)[9:30]
+traits
+```
+
+Let's take a look of checks used in the trials:
+
+```{r}
+sort(table(data.pheno$accession_name))
+```
+
+The checks consist of seven full-sib parents and the individuals CR138 and PER183.
+
+```{r}
+table(data.pheno$check)
+data.pheno$check[which(substr(data.pheno$accession_name, 1, 2) == "GM")] <- 0
+data.pheno$check[which(substr(data.pheno$accession_name, 1, 2) != "GM")] <- 1
+table(data.pheno$check)
+data.pheno$pop <- abs(data.pheno$check - 1)
+table(data.pheno$pop)
+```
+
+Boxplots for all traits:
+
+```{r, message = FALSE, fig.width = 10, fig.height = 7, dpi = 150}
+long.data <- reshape2::melt(data.pheno, measure.vars = traits)
+head(long.data)
+ggplot(data = long.data, aes(x = trial_harvest, y = value)) + 
+  geom_boxplot() +
+  geom_point(data = long.data %>% filter(check == 1), aes(color = accession_name), position = "jitter", alpha = 0.5) +
+  facet_wrap(~ variable, scales = "free_y", nrow = 3) + theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom")
+```
+
+Boxplots for cooking quality-related traits:
+
+```{r, message = FALSE, fig.width = 10, fig.height = 5, dpi = 150}
+traits <- traits[-c(1:9)]
+long.data <- long.data %>% filter(variable %in% traits)
+long.data$variable <- factor(long.data$variable, levels = traits)
+head(long.data)
+ggplot(data = long.data, aes(x = trial_harvest, y = value)) +
+  geom_boxplot() + 
+  geom_point(data = long.data %>% filter(check == 1), aes(color = accession_name), position = "jitter", alpha = 0.5) +
+  facet_wrap(~ variable, scales = "free_y", nrow = 2) + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom")
+```
+
+## Mixed Model Analysis
+
+For the selected traits (DM_NIRS, WAB_20min_mean, and WAB_30min_mean), the mixed model below will be fitted to estimate (i) variance components, (ii) broad-sense heritability (plant level), and (iii) predictions by treating genotype as random effect. Genetic correlations will be also estimated using the predictions. Additionally, the genotype effects will be declared as a fixed term in the model, and the individual's best linear unbiased estimates (BLUEs) will be used for QTL mapping purposes. The aim is to avoid double shrinkage due to the inclusion of random genetic effects specifically in the GWAS model. 
+
+$$y_{ij} = \mu + t_j + g_i + f(r,c) + \varepsilon_{ij}$$
+where 
+- $y_{ij}$ is the phenotypic observation of genotype $i$ in trial $j$, 
+- $t_j$ is the fixed effect of trial $j$ ($j=1,\dots,J$; $J=4$),
+- $g_i$ is the effect of genotype $i$ separated into random effects of progenies ($i=1,\dots,I_g$; $I_g=381$, with $g_i \sim N(0, \sigma^2_g)$, and fixed effects of parents and checks ($i=I_g+1,\dots,I_g+I_c$; $I_c=9$, 
+- $f(r,c)$ is the random effect of spatial trends considering the row and column levels, and 
+- $\varepsilon_{ij}$ is the residual random error with $\varepsilon_{ij} \sim N(0, \sigma^2)$.
+
+### DM_NIRS
+
+```{r, message = FALSE, warning=FALSE}
+model.DM <- mmer(DM_NIRS ~ trial_harvest + check:accession_name,
+                 random = ~ pop:accession_name + spl2D(row_number, col_number, at.levels = trial_harvest),
+                 rcov = ~ vs(ds(trial_harvest), units),
+                 data = data.pheno, verbose = TRUE)
+plot(model.DM)
+summary(model.DM)
+coef.mmer(model.DM)
+summary(model.DM)$varcomp
+heritability.DM <- vpredict(model.DM, h2 ~ (V1) / (V1 + (V3+V4+V5+V6)/4))
+heritability.DM
+checks <- paste("pop:accession_name", unique(data.pheno$accession_name[data.pheno$check == 1]), sep = "")
+BLUPs.DM <- coef.mmer(model.DM)$Estimate[1] + randef(model.DM)[[1]]$DM_NIRS[!names(randef(model.DM)[[1]]$DM_NIRS) %in% checks]
+head(BLUPs.DM, 10)
+length(BLUPs.DM)
+```
+
+### WAB_20min_mean
+
+```{r}
+model.WAB20 <- mmer(WAB_20min_mean ~ trial_harvest + check:accession_name,
+                    random = ~ pop:accession_name + spl2D(row_number, col_number, at.levels = trial_harvest),
+                    rcov = ~vs(ds(trial_harvest), units),
+                    data = data.pheno, verbose = TRUE)
+plot(model.WAB20)
+summary(model.WAB20)
+coef.mmer(model.WAB20)
+summary(model.WAB20)$varcomp
+heritability.WAB20 <- vpredict(model.WAB20, h2 ~ (V1) / (V1 + (V3+V4+V5+V6)/4))
+heritability.WAB20
+BLUPs.WAB20 <- coef.mmer(model.WAB20)$Estimate[1] + randef(model.WAB20)[[1]]$WAB_20min_mean[!names(randef(model.WAB20)[[1]]$WAB_20min_mean) %in% checks]
+head(BLUPs.WAB20, 10)
+length(BLUPs.WAB20)
+```
+
+### WAB_30min_mean
+
+```{r, message = FALSE, warning=FALSE}
+model.WAB30 <- mmer(WAB_30min_mean ~ trial_harvest + check:accession_name,
+                    random = ~ pop:accession_name + spl2D(row_number, col_number, at.levels = trial_harvest),
+                    rcov = ~ vs(ds(trial_harvest), units),
+                    data = data.pheno, verbose = TRUE)
+plot(model.WAB30)
+summary(model.WAB30)
+coef.mmer(model.WAB30)
+summary(model.WAB30)$varcomp
+heritability.WAB30 <- vpredict(model.WAB30, h2 ~ (V1) / (V1 + (V3+V4+V5+V6)/4))
+heritability.WAB30
+BLUPs.WAB30 <- coef.mmer(model.WAB30)$Estimate[1] + randef(model.WAB30)[[1]]$WAB_30min_mean[!names(randef(model.WAB30)[[1]]$WAB_30min_mean) %in% checks]
+head(BLUPs.WAB30, 10)
+length(BLUPs.WAB30)
+```
+
+Heritability table:
+
+```{r}
+heritability <- rbind(heritability.DM, heritability.WAB20, heritability.WAB30)
+rownames(heritability) <- c("DM_NIRS", "WAB_20min_mean", "WAB_30min_mean")
+knitr::kable(heritability)
+```
+
+Pairwise correlations:
+
+```{r, message = FALSE, warning=FALSE, fig.width = 10, fig.height = 5, dpi = 150}
+BLUPs.DM.WAB20.WAB30 <- cbind(BLUPs.DM, BLUPs.WAB20, BLUPs.WAB30)
+head(BLUPs.DM.WAB20.WAB30, 10)
+rownames(BLUPs.DM.WAB20.WAB30) <- gsub(pattern = "pop:accession_name", replacement = "", rownames(BLUPs.DM.WAB20.WAB30))
+colnames(BLUPs.DM.WAB20.WAB30) <- c("DM_NIRS", "WAB_20min_mean", "WAB_30min_mean")
+head(BLUPs.DM.WAB20.WAB30)
+correlation <- cor(BLUPs.DM.WAB20.WAB30)
+correlation
+chart.Correlation(BLUPs.DM.WAB20.WAB30, histogram = TRUE, method = "pearson")
+```
+
+# Genome-Wide Association Study (GWAS)
+
+## Preparing the VCF file
+
+We will use the six full-sib families, which constitute the first population in the VCF. Let's load the VCF file containing the sample of 9,000 markers and the individuals of both populations:
+
+```{r}
+vcf.file.P1.P2 <- read.vcfR(file = "samplesnp_1.vcf.gz", verbose = TRUE)
+head(vcf.file.P1.P2)
+```
+
+Loading the information from population and pedigree of the genotyped individuals: 
+
+```{r}
+indiv.vcf <- read.csv(file = "Indiv_VCF_File_Info_Pop_Family.csv", header = TRUE)
+head(indiv.vcf)
+table(indiv.vcf$Population)
+P1 <- which(indiv.vcf$Population == "P1")
+Pr <- which(indiv.vcf$Population == "Parents")
+indiv.vcf.P1 <- indiv.vcf[c(P1, Pr),]
+table(indiv.vcf.P1$Population)
+```
+
+Let's save the individuals from the first population:
+
+```{r}
+corresp.P1 <- colnames(vcf.file.P1.P2@gt) %in% indiv.vcf.P1$Indiv_VCF
+columns.to.keep <- c(1,which(corresp.P1 == TRUE))
+vcf.file.P1 <- vcf.file.P1.P2 # to get the vcf structure
+vcf.file.P1@gt <- vcf.file.P1@gt[,columns.to.keep] 
+dim(vcf.file.P1@gt) # 227 + 13
+```
+
+Checking the amount of individuals for each full-sib family:
+
+```{r}
+split.names <- strsplit(colnames(vcf.file.P1@gt)[-1], split = "_")
+split.names <- sapply(split.names, unlist)
+split.names <- as.data.frame(t(split.names))
+colnames(split.names) <- c("trial","id","ind")
+head(split.names)
+split.names$family <- substr(split.names$ind, 1, 7)
+table(split.names$family)
+split.names$family[which(split.names$family == "SM3759-")] <- split.names$ind[which(split.names$family == "SM3759-")]
+```
+
+To perform association mapping, we need to extract the genotypic data from the original VCF file:
+
+```{r}
+vcf.file.P1.geno <- extract.gt(vcf.file.P1, element = "GT", as.numeric = FALSE, return.alleles = FALSE, IDtoRowNames = TRUE, extract = TRUE, convertNA = FALSE)
+vcf.file.P1.geno[1:5,1:5]
+vcf.file.P1.geno <- apply(vcf.file.P1.geno, 2, function(x) unlist(lapply(strsplit(x, split = ""), function(y) paste(y[c(1,3)], collapse = ""))))
+for(i in 1:nrow(vcf.file.P1.geno)) {
+  vcf.file.P1.geno[i,][which(vcf.file.P1.geno[i,] == "..")] <- NA
+}
+vcf.file.P1.geno[1:5,1:5]
+```
+
+Let's check which genotypes were really phenotyped for the traits and only use them to perform GWAS:
+
+```{r}
+BLUEs.DM.WAB <- read.csv(file = "BLUEs_DM_WAB.csv", header = TRUE)
+head(BLUEs.DM.WAB)
+```
+
+
+```{r}
+corresp <- colnames(vcf.file.P1.geno) %in% BLUEs.DM.WAB$genotype
+vcf.file.P1.geno.DM.WAB <- vcf.file.P1.geno[,which(corresp == TRUE)]
+dim(vcf.file.P1.geno.DM.WAB)
+```
+
+Since we will use a numeric format (0, 1, 2) for the genotypic data, it is need to convert the original data from a VCF file. The users can transform the data by their own and also filter them for some parameters, such as minor allele frequency (MAF), number of genotypes and markers to be considered following some proportion of missing data, and so on. Moreover, a imputation can be done for missing data. For now, we will transform and filter genotypic data for the numeric format using the R package `statgenGWAS`.
+
+```{r}
+# Geno:
+vcf.file.P1.geno.DM.WAB <- t(vcf.file.P1.geno.DM.WAB)
+dim(vcf.file.P1.geno.DM.WAB)
+vcf.file.P1.geno.DM.WAB[1:5,1:5]
+vcf.file.P1.geno.DM.WAB <- vcf.file.P1.geno.DM.WAB[,order(colnames(vcf.file.P1.geno.DM.WAB))]
+vcf.file.P1.geno.DM.WAB[1:5,1:5]
+```
+
+
+```{r}
+# Map:
+spliting.names <- strsplit(colnames(vcf.file.P1.geno.DM.WAB), split = "")
+chr <- unlist(lapply(spliting.names, function(x) paste(x[(which(x == "_")-2):(which(x == "_")-1)],
+                                                       collapse = "")))
+pos <- unlist(lapply(spliting.names, function(x) paste(x[(which(x == "_")+1):(length(x))],
+                                                       collapse = "")))
+table(chr)
+map <- data.frame(chr = chr, pos = pos)
+head(map)
+dim(map)
+rownames(map) <- colnames(vcf.file.P1.geno.DM.WAB)
+head(map)
+str(map)
+map$pos <- as.numeric(map$pos)
+```
+
+
+```{r}
+cassava.data <- createGData(geno = vcf.file.P1.geno.DM.WAB, map = map)
+```
+
+
+```{r}
+cassava.data.coded <- codeMarkers(gData = cassava.data, refAll = rep("0", times = ncol(vcf.file.P1.geno.DM.WAB)),
+                                  nMissGeno = 0.40, nMiss = 0.50, impute = TRUE, imputeType = "fixed", fixedValue = 1,
+                                  MAF = 0.05, removeDuplicates = TRUE, verbose = TRUE)
+```
+
+With the genotypic data in numeric format, we can prepare the files for running GWAS in the R package `rMVP`.
+
+```{r}
+# Geno:
+data.for.rMVP <- cassava.data.coded$markers
+dim(data.for.rMVP)
+data.for.rMVP[1:5,1:5]
+data.for.rMVP <- t(data.for.rMVP)
+dim(data.for.rMVP)
+data.for.rMVP[1:5,1:5]
+```
+
+
+```{r}
+# Map:
+map.for.rMVP <- map
+dim(map.for.rMVP)
+head(map.for.rMVP)
+map.for.rMVP$Pos <- map.for.rMVP$pos
+map.for.rMVP <- map.for.rMVP[,-2]
+map.for.rMVP$SNP <- rownames(map.for.rMVP)
+map.for.rMVP <- map.for.rMVP[rownames(data.for.rMVP),]
+rownames(map.for.rMVP) <- 1:nrow(map.for.rMVP)
+colnames(map.for.rMVP)[1] <- "Chr"
+map.for.rMVP <- map.for.rMVP[,c("SNP","Chr","Pos")]
+head(map.for.rMVP)
+str(map.for.rMVP)
+dim(map.for.rMVP)
+```
+
+
+```{r}
+write.table(map.for.rMVP, file = "Map_For_rMVP.txt", row.names = FALSE, sep = "\t")
+```
+
+For a suitable reading of data from R package `rMVP`, it is needed to save the file as a big matrix:
+
+```{r}
+data.for.rMVP <- as.matrix(data.for.rMVP)
+data.for.rMVP[1:5,1:5]
+data.for.rMVP <- as.big.matrix(data.for.rMVP)
+data.for.rMVP[1:5,1:5]
+```
+
+
+```{r}
+write.big.matrix(data.for.rMVP, file = "Data_For_rMVP.txt", row.names = FALSE, sep = "\t")
+```
+
+Preparing files in the R package `rMVP` for run GWAS:
+
+```{r}
+MVP.Data(fileNum = "Data_For_rMVP.txt", filePhe = "BLUEs_DM_WAB.csv", fileMap = "Map_For_rMVP.txt",
+         sep.num = "\t", sep.phe = ",", sep.map = "\t", SNP.impute = NULL, fileKin = FALSE, filePC = FALSE, 
+         out = "mvp", priority = "speed", verbose = TRUE)
+MVP.Data.Kin(fileKin = TRUE, sep = "\t", mvp_prefix = "mvp", out = "mvp",
+             priority = "speed", verbose = TRUE)
+MVP.Data.PC(filePC = TRUE, sep = "\t", pcs.keep = 5, mvp_prefix = "mvp", out = "mvp", 
+            priority = "speed", verbose = TRUE)
+```
+
+Let's load the files created by R package `rMVP` in the current directory:
+
+```{r}
+genotype <- attach.big.matrix("mvp.geno.desc")
+phenotype <- read.table("mvp.phe", head = TRUE)
+map <- read.table("mvp.geno.map", head = TRUE)
+kinship <- attach.big.matrix("mvp.kin.desc")
+```
+
+## Genomic-based Relationship Matrix (K Matrix)
+
+```{r, fig.width = 10, fig.height = 7, dpi = 150}
+kinship.plot <- MVP.K.VanRaden(M = genotype, priority = "speed", cpu = 1, verbose = TRUE)
+dim(kinship.plot)
+kinship.plot[1:5,1:5]
+rownames(kinship.plot) <- colnames(data.for.rMVP)
+colnames(kinship.plot) <- colnames(data.for.rMVP)
+heatmap(kinship.plot, Rowv = TRUE, Colv = TRUE)
+```
+
+## Population Structure (Q Matrix)
+
+Although the R package `rMVP` will automatically create a PCA plot in the current directory, from the run of its GWAS function, we will build it by ourselves using the principal components calculated by `rMVP`. Thus, it will be possible to input and view the clustering patterns considering particular filtering, such as different fullsib families, which constitute the first population (P1):
+
+```{r}
+pca <- MVP.PCA(M = genotype, priority = "speed", pcs.keep = 5, cpu = 1, verbose = TRUE)
+head(pca)
+dim(pca)
+rownames(pca) <- colnames(data.for.rMVP)
+colnames(pca) <- c("PC1", "PC2", "PC3", "PC4", "PC5")
+head(pca)
+pca <- as.data.frame(pca)
+indiv.vcf.P1.pca <- indiv.vcf.P1[which(indiv.vcf.P1$Indiv_VCF %in% rownames(pca) == TRUE),]
+indiv.vcf.P1.pca <- indiv.vcf.P1.pca[order(indiv.vcf.P1.pca$Indiv_VCF),]
+pca <- pca[order(rownames(pca)),]
+head(cbind(indiv.vcf.P1.pca$Indiv_VCF, rownames(pca)), 20)
+pca$Family <- indiv.vcf.P1.pca$Family
+head(pca)
+```
+
+
+```{r, fig.width = 10, fig.height = 7, dpi = 150}
+ggplot(pca, aes(PC1, PC2, colour = Family)) + geom_point(size = 2, shape = 1, alpha = 0.7) +
+  scale_color_manual(values = brewer.pal(n = 11, "Paired")) +
+  xlab("PC1") + ylab("PC2") +
+  theme_bw()
+```
+
+Let's check the proportion explained by the first three principal components. We are going to run PCA again using the R function `prcomp`, because the function from `rMVP` does not provide the variance of these components.   
+
+```{r}
+prin.comp <- prcomp(kinship.plot, scale = TRUE)
+eig <- get_eigenvalue(prin.comp)
+round(sum(eig$variance.percent[1]),1)
+round(sum(eig$variance.percent[2]),1)
+round(sum(eig$variance.percent[1:3]),1)
+```
+
+
+```{r, fig.width = 10, fig.height = 7, dpi = 150}
+fviz_eig(prin.comp)
+```
+
+## GWAS Analyses
+
+Running GWAS analyses for the traits `DM_NIRS`, `WAB_20min_mean`, and `WAB_30min_mean`:
+
+```{r}
+GWAS.rMVP <- vector("list", ncol(phenotype)-1)
+for(i in 2:ncol(phenotype)) {
+  GWAS.rMVP[[i-1]] <- MVP(phe = phenotype[,c(1,i)],
+                          geno = genotype,
+                          map = map,
+                          K = kinship,
+                          nPC.GLM = 5,
+                          nPC.MLM = 3,
+                          nPC.FarmCPU = 3,
+                          #CV.GLM = NULL,
+                          #CV.MLM = NULL,
+                          #CV.FarmCPU = NULL,
+                          priority = "speed",
+                          ncpus = 1,
+                          vc.method = "BRENT",
+                          maxLoop = 12,
+                          method.bin = "static",
+                          permutation.threshold = TRUE,
+                          permutation.rep = 1000,
+                          method = c("GLM","MLM","FarmCPU"),
+                          file.output = c("pmap","pmap.signal","plot","log"),
+                          verbose = FALSE)
+}
+save(GWAS.rMVP, file = "GWAS_rMVP.RData")
+```
+
+Density Plot:
+
+```{r, echo = FALSE, out.width = "100%"}
+knitr::include_graphics("DM_NIRS.GLM.DM_NIRS.MLM.DM_NIRS.FarmCPU.SNP-Density.jpg")
+```
+
+Let's investigate the GWAS results for the traits `DM_NIRS`, `WAB_20min_mean`, and `WAB_30min_mean`, which were also considered for QTL mapping.
+
+### DM_NIRS
+
+QQplot of GWAS models for DM_NIRS:
+
+```{r, echo = FALSE, out.width = "100%"}
+knitr::include_graphics("DM_NIRS.GLM.DM_NIRS.MLM.DM_NIRS.FarmCPU.Multraits-QQplot.jpg")
+```
+
+Manhattan Plot of GWAS models for DM_NIRS:
+
+```{r, echo = FALSE, out.width = "100%"}
+knitr::include_graphics("DM_NIRS.GLM.DM_NIRS.MLM.DM_NIRS.FarmCPU.Multracks-Manhattan.jpg")
+```
+
+Statistically significant SNPs additive effects for DM_NIRS:
+
+```{r}
+DM.NIRS.GLM.signals <- read.csv(file = "DM_NIRS.GLM_signals.csv", header = TRUE)
+DM.NIRS.GLM.signals
+DM.NIRS.MLM.signals <- read.csv(file = "DM_NIRS.MLM_signals.csv", header = TRUE)
+DM.NIRS.MLM.signals
+DM.NIRS.FarmCPU.signals <- read.csv(file = "DM_NIRS.FarmCPU_signals.csv", header = TRUE)
+DM.NIRS.FarmCPU.signals
+```
+
+### WAB_20min_mean
+
+QQplot of GWAS models for WAB_20min_mean:
+
+```{r, echo = FALSE, out.width = "100%"}
+knitr::include_graphics("WAB_20min_mean.GLM.WAB_20min_mean.MLM.WAB_20min_mean.FarmCPU.Multraits-QQplot.jpg")
+```
+
+Manhattan Plot of GWAS models for WAB_20min_mean:
+
+```{r, echo = FALSE, out.width = "100%"}
+knitr::include_graphics("WAB_20min_mean.GLM.WAB_20min_mean.MLM.WAB_20min_mean.FarmCPU.Multracks-Manhattan.jpg")
+```
+
+Statistically significant SNPs additive effects for WAB_20min_mean:
+
+```{r}
+WAB.20min.mean.GLM.signals <- read.csv(file = "WAB_20min_mean.GLM_signals.csv", header = TRUE)
+WAB.20min.mean.GLM.signals
+WAB.20min.mean.MLM.signals <- read.csv(file = "WAB_20min_mean.MLM_signals.csv", header = TRUE)
+WAB.20min.mean.MLM.signals
+WAB.20min.mean.FarmCPU.signals <- read.csv(file = "WAB_20min_mean.FarmCPU_signals.csv", header = TRUE)
+WAB.20min.mean.FarmCPU.signals
+```
+
+### WAB_30min_mean
+
+QQplot of GWAS models for WAB_30min_mean:
+
+```{r, echo = FALSE, out.width = "100%"}
+knitr::include_graphics("WAB_30min_mean.GLM.WAB_30min_mean.MLM.WAB_30min_mean.FarmCPU.Multraits-QQplot.jpg")
+```
+
+Manhattan Plot of GWAS models for WAB_30min_mean:
+
+```{r, echo = FALSE, out.width = "100%"}
+knitr::include_graphics("WAB_30min_mean.GLM.WAB_30min_mean.MLM.WAB_30min_mean.FarmCPU.Multracks-Manhattan.jpg")
+```
+
+Statistically significant SNPs additive effects for WAB_30min_mean:
+
+```{r}
+WAB.30min.mean.GLM.signals <- read.csv(file = "WAB_30min_mean.GLM_signals.csv", header = TRUE)
+WAB.30min.mean.GLM.signals
+WAB.30min.mean.MLM.signals <- read.csv(file = "WAB_30min_mean.MLM_signals.csv", header = TRUE)
+WAB.30min.mean.MLM.signals
+WAB.30min.mean.FarmCPU.signals <- read.csv(file = "WAB_30min_mean.FarmCPU_signals.csv", header = TRUE)
+WAB.30min.mean.FarmCPU.signals
+```
